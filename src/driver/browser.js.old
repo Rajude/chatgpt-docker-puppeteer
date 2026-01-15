@@ -1,0 +1,227 @@
+/* src/driver/browser.js (Audit Level 18 - Final Master) */
+const fs = require('fs');
+const path = require('path');
+const { log } = require('../core/logger');
+const CONFIG = require('../core/config');
+
+const stabilizer = require('./stabilizer');
+const analyzer = require('./analyzer');
+const human = require('./human');
+const adaptive = require('../logic/adaptive');
+const triage = require('./triage');
+const i18n = require('../core/i18n');
+
+const RULES_PATH = path.join(__dirname, '../../dynamic_rules.json');
+let cachedInputSelector = null;
+let cachedSendSelector = null; // NOVO: Cache para botão
+let pendingLearning = null;
+
+async function detectPageLanguage(page) {
+  try { return await page.evaluate(() => document.documentElement.lang || 'en'); } catch (e) { return 'en'; }
+}
+
+function persistLearnedSelector(selector, type = 'input_box') {
+  try {
+    let rules = {};
+    if (fs.existsSync(RULES_PATH)) rules = JSON.parse(fs.readFileSync(RULES_PATH, 'utf-8'));
+    if (!rules.selectors) rules.selectors = {};
+    if (!rules.selectors[type]) rules.selectors[type] = [];
+    
+    if (!rules.selectors[type].includes(selector)) {
+      rules.selectors[type].unshift(selector);
+      fs.writeFileSync(RULES_PATH, JSON.stringify(rules, null, 2));
+      log('INFO', `[SADI] Seletor (${type}) salvo: ${selector}`);
+    }
+  } catch (e) {}
+}
+
+async function commitLearning() {
+    if (pendingLearning) {
+        const { lang, term } = pendingLearning;
+        if (/^[a-z\u00C0-\u00FF]+$/i.test(term)) {
+            i18n.learnTerm(lang, 'input_placeholders', term);
+            log('INFO', `[SADI] Vocabulário aprendido: "${term}"`);
+        }
+        pendingLearning = null;
+    }
+}
+
+async function closeModals(page) {
+  const lang = await detectPageLanguage(page);
+  const closeTerms = i18n.getTerms('close_actions', lang);
+  await page.evaluate((terms) => {
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+    // Procura botões visíveis que tenham texto de fechamento
+    const closeBtn = buttons.find(b => {
+      const text = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase().trim();
+      return terms.some(w => text === w) && b.offsetParent !== null;
+    });
+    
+    if (closeBtn) {
+      // Clica nativamente para garantir (modais costumam bloquear ghost cursor)
+      closeBtn.click();
+    }
+  }, closeTerms);
+}
+
+async function resolveInputSelector(page) {
+  if (cachedInputSelector) {
+    const valid = await page.$(cachedInputSelector);
+    if (valid) return cachedInputSelector;
+    cachedInputSelector = null;
+  }
+
+  const staticList = CONFIG.rules.selectors?.input_box || [];
+  for (const sel of staticList) {
+    if (await page.$(sel)) {
+      cachedInputSelector = sel;
+      return sel;
+    }
+  }
+
+  log('INFO', '[SADI] Iniciando descoberta...');
+  await stabilizer.waitForStability(page);
+  await closeModals(page); 
+  
+  const lang = await detectPageLanguage(page);
+  const result = await analyzer.findChatInputSelector(page, lang);
+  
+  if (result && result.selector) {
+    if (await analyzer.validateCandidateInteractivity(page, result.selector)) {
+      log('INFO', `[SADI] Novo seletor: ${result.selector}`);
+      cachedInputSelector = result.selector;
+      persistLearnedSelector(result.selector, 'input_box');
+      if (result.term && result.term.length > 2) pendingLearning = { lang, term: result.term };
+      return result.selector;
+    }
+  }
+  throw new Error('SADI_FATAL: Input não encontrado.');
+}
+
+// NOVO: Resolve botão de envio dinamicamente
+async function resolveSendButton(page) {
+    if (cachedSendSelector && await page.$(cachedSendSelector)) return cachedSendSelector;
+    
+    // Tenta regras estáticas
+    const staticList = CONFIG.rules.selectors?.send_button || [];
+    for (const sel of staticList) {
+        if (await page.$(sel)) {
+            cachedSendSelector = sel;
+            return sel;
+        }
+    }
+    
+    // Fallback genérico (SADI Lite para botão)
+    // Procura botão próximo ao input ou com atributo data-testid
+    return '[data-testid="send-button"]'; 
+}
+
+async function ensureFocus(page) {
+  await stabilizer.waitForStability(page);
+  const selector = await resolveInputSelector(page);
+  try { await page.focus(selector); } 
+  catch (e) { await page.evaluate((s) => { const el = document.querySelector(s); if(el) el.focus(); }, selector); }
+}
+
+async function typePrompt(page, text, taskId) {
+  let attempts = 0;
+  while (attempts < 3) {
+    try {
+      const selector = await resolveInputSelector(page);
+      const lag = await stabilizer.measureEventLoopLag(page);
+      
+      if (lag > 200 || text.length > 1000) {
+        log('WARN', `Modo Zen (Lag: ${lag.toFixed(0)}ms).`, taskId);
+        await page.evaluate((sel, content) => {
+          const el = document.querySelector(sel);
+          if (el) {
+            el.focus();
+            const success = document.execCommand('insertText', false, content);
+            if (!success) {
+                if (typeof el.value === 'string') {
+                   const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+                   if (setter) setter.call(el, content); else el.value = content;
+                } else { el.innerText = content; }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          }
+        }, selector, text);
+        await new Promise(r => setTimeout(r, 1000));
+      } else {
+        await human.humanClick(page, selector);
+        await human.humanType(page, text);
+      }
+
+      // ENVIO SEGURO
+      await page.keyboard.press('Enter');
+      await new Promise(r => setTimeout(r, 1000));
+
+      const inputValue = await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          return el ? (el.value || el.innerText || '') : '';
+      }, selector);
+
+      if (inputValue.trim().length > 0) {
+          log('WARN', 'Enter falhou. Tentando clique no botão...', taskId);
+          // Usa resolução dinâmica para o botão
+          const sendBtnSel = await resolveSendButton(page);
+          await page.click(sendBtnSel).catch(() => {});
+      }
+      return;
+
+    } catch (e) {
+      if (e.message.includes('detached') || e.message.includes('Target closed')) {
+        cachedInputSelector = null;
+        attempts++;
+        await new Promise(r => setTimeout(r, 1000));
+      } else { throw e; }
+    }
+  }
+  throw new Error('Falha ao digitar após 3 tentativas.');
+}
+
+async function waitForResponse(page, startMsgCount) {
+  let lastText = '';
+  let stableCycles = 0;
+  
+  await page.evaluate(() => {
+    if (!window.__wd_obs) {
+      window.__wd_last_change = Date.now();
+      window.__wd_obs = new MutationObserver(() => window.__wd_last_change = Date.now());
+      window.__wd_obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+  });
+
+  while (true) {
+    const lang = await detectPageLanguage(page);
+    const status = await triage.diagnoseStall(page, lang);
+    
+    if (status === 'LIMIT_REACHED') throw new Error('LIMIT_REACHED');
+    if (status === 'CAPTCHA') throw new Error('CAPTCHA_DETECTED');
+    if (status === 'LOGIN_REQUIRED') throw new Error('LOGIN_REQUIRED');
+
+    const msgs = await page.$$eval('div[data-message-author-role="assistant"]', ns => ns.map(n => n.innerText)).catch(() => []);
+    const currentText = msgs.slice(startMsgCount).join('\n\n').trim();
+
+    if (currentText && currentText === lastText && currentText.length > 0) stableCycles++;
+    else stableCycles = 0;
+    lastText = currentText;
+
+    if (stableCycles >= CONFIG.STABLE_CYCLES) return currentText;
+
+    const lastChange = await page.evaluate(() => window.__wd_last_change).catch(() => Date.now());
+    const gap = Date.now() - lastChange;
+    const dynamicTimeout = adaptive.getAdjustedTimeout ? adaptive.getAdjustedTimeout(msgs.length) : CONFIG.PROGRESS_TIMEOUT_MS;
+
+    if (gap > dynamicTimeout) {
+      if (status === 'THINKING' || status === 'LOADING') {
+         await page.evaluate(() => window.__wd_last_change = Date.now());
+         continue;
+      }
+      throw new Error(`STALL_DETECTED: ${status}`);
+    }
+    await new Promise(r => setTimeout(r, CONFIG.STABILITY_INTERVAL));
+  }
+}
+
+module.exports = { ensureFocus, typePrompt, waitForResponse, commitLearning };

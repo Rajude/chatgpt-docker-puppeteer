@@ -1,0 +1,264 @@
+/* ==========================================================================
+   INDEX.JS — AGENTE UNIVERSAL
+   AUDIT LEVEL 25 — ORCHESTRATED + OBSERVABLE + SELF-HEALING
+
+   Responsabilidades:
+   - Orquestração de tarefas
+   - Gestão de ciclo de vida
+   - Separação rigorosa: INFRA x LLM
+   - Integração profunda com ConnectionOrchestrator
+========================================================================== */
+
+const path = require('path');
+
+// Core / Infra
+const logger = require('./src/core/logger');
+const CONFIG = require('./src/core/config');
+const schemas = require('./src/core/schemas');
+const io = require('./src/infra/io');
+const forensics = require('./src/core/forensics');
+const memory = require('./src/core/memory');
+const system = require('./src/infra/system');
+
+// Drivers
+const browserDriver = require('./src/driver/browser');
+const triage = require('./src/driver/triage');
+
+// Orchestrator
+const { ConnectionOrchestrator } = require('./src/infra/connection_orchestrator');
+
+const { log } = logger;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ==========================================================================
+   ESTADO GLOBAL
+========================================================================== */
+let consecutiveTaskFailures = 0;
+let consecutiveInfraFailures = 0;
+let lastInfraHeartbeat = 0;
+
+/* ==========================================================================
+   HELPERS
+========================================================================== */
+function sanitizePrompt(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim();
+}
+
+function classifyFailure(task, type, message) {
+  task.state.status = 'FAILED';
+  task.state.fail_type = type; // 'INFRA' | 'LLM' | 'SCHEMA' | 'UNKNOWN'
+  task.state.history.push({
+    ts: new Date().toISOString(),
+    type,
+    msg: message
+  });
+}
+
+/* ==========================================================================
+   MAIN ENGINE
+========================================================================== */
+async function main() {
+  if (!global.gc) {
+    log('WARN', 'GC manual desativado. Use --expose-gc para sessões longas.');
+  }
+
+  log('INFO', 'Engine V25.0 iniciada (Orchestrated)');
+
+  // Inicialização do Orchestrator (Persistente)
+  const orchestrator = new ConnectionOrchestrator({
+    allowedDomains: ['chatgpt.com', 'gemini.google.com']
+  });
+
+  let browser = null;
+  let page = null;
+
+  while (true) {
+    try {
+      // 1. CONTROLE EXTERNO
+      if (io.checkControlPause()) {
+        await sleep(CONFIG.IDLE_SLEEP);
+        continue;
+      }
+
+      // 2. BACKOFF (SEPARADO)
+      if (consecutiveTaskFailures > 0) {
+        await sleep(Math.min(300000, consecutiveTaskFailures * 5000));
+      }
+      if (consecutiveInfraFailures > 0) {
+        await sleep(Math.min(60000, consecutiveInfraFailures * 3000));
+      }
+
+      // 3. HEARTBEAT DE INFRA
+      if (Date.now() - lastInfraHeartbeat > 60000) {
+        log('INFO', '[INFRA][HEARTBEAT]', orchestrator.getStatus());
+        lastInfraHeartbeat = Date.now();
+      }
+
+      // 4. AQUISIÇÃO DE CONTEXTO (INFRA)
+      try {
+        const ctx = await orchestrator.acquireContext();
+        browser = ctx.browser;
+        page = ctx.page;
+        consecutiveInfraFailures = 0;
+      } catch (infraErr) {
+        consecutiveInfraFailures++;
+        log('WARN', `[INFRA] Indisponível: ${infraErr.message}`);
+        await sleep(5000);
+        continue;
+      }
+
+      // 5. AQUISIÇÃO DE TAREFA
+      const rawTask = io.loadNextTask();
+      if (!rawTask) {
+        consecutiveTaskFailures = 0;
+        await sleep(CONFIG.IDLE_SLEEP);
+        continue;
+      }
+
+      let task;
+      try {
+        task = schemas.parseTask(rawTask);
+      } catch (schemaErr) {
+        log('ERROR', `Schema inválido: ${schemaErr.message}`, rawTask.id);
+        rawTask.status = 'FAILED';
+        rawTask.erro = schemaErr.message;
+        io.saveTask(rawTask);
+        continue;
+      }
+
+      if (!io.acquireLock(task.meta.id)) {
+        await sleep(1000);
+        continue;
+      }
+
+      log('INFO', `>>> Tarefa ${task.meta.id}`, task.meta.id);
+      task.state.status = 'RUNNING';
+      task.state.started_at = new Date().toISOString();
+      task.state.attempts++;
+      io.saveTask(task);
+
+      try {
+        // 6. PREPARAÇÃO DE CONTEXTO (TARGET)
+        const modelId = task.spec?.model || CONFIG.DEFAULT_MODEL_ID || 'gpt-5';
+        const forceReset = task.spec?.config?.reset_context || task.meta?.source === 'bulk';
+
+        // Verifica se precisa navegar (New Chat ou Modelo Diferente)
+        if (forceReset || !page.url().includes(`model=${modelId}`)) {
+          log('INFO', `Navegando para modelo ${modelId}`, task.meta.id);
+          await page.goto(`https://chatgpt.com/?model=${modelId}`, {
+              waitUntil: 'domcontentloaded',
+              timeout: 20000
+            }).catch(async () => {
+              log('WARN', 'Navegação lenta, tentando reload...', task.meta.id);
+              await page.reload({ waitUntil: 'domcontentloaded' });
+            });
+          await sleep(3000);
+        }
+
+        // 7. PROMPT (SANITIZAÇÃO + MEMÓRIA)
+        let userMsg = sanitizePrompt(task.spec.payload.user_message);
+        let sysMsg = sanitizePrompt(task.spec.payload.system_message);
+
+        try {
+            userMsg = memory.resolveContext(userMsg);
+            if (sysMsg) sysMsg = memory.resolveContext(sysMsg);
+        } catch (memErr) {
+            throw new Error(`Memory Error: ${memErr.message}`);
+        }
+
+        if (!userMsg) throw new Error('PROMPT_VAZIO');
+
+        const finalPrompt = sysMsg 
+          ? `[INSTRUÇÃO DO SISTEMA]\n${sysMsg}\n[FIM]\n\n${userMsg}` 
+          : userMsg;
+
+        const startMsgCount = await page.$$eval('div[data-message-author-role="assistant"]', els => els.length).catch(() => 0);
+
+        await browserDriver.typePrompt(page, finalPrompt, task.meta.id);
+        await page.keyboard.press('Enter');
+
+        // 8. COLETA DE RESPOSTA (LLM)
+        let fullResponse = '';
+        let cycles = 0;
+        let lastChunk = '';
+        const safeId = io.sanitizeFilename(task.meta.id);
+        const outPath = path.join(io.OUTPUT_DIR, `${safeId}.txt`);
+
+        while (true) {
+          try {
+            const chunk = await browserDriver.waitForResponse(page, startMsgCount);
+
+            if (chunk === lastChunk && cycles > 0) break;
+            lastChunk = chunk;
+
+            fullResponse += (fullResponse ? '\n\n' : '') + chunk;
+            io.atomicWrite(outPath, fullResponse);
+
+            if (++cycles >= CONFIG.MAX_CONTINUATIONS) break;
+            
+            // Critérios de Fim (Código ou Pontuação)
+            const isCodeBlock = chunk.trim().endsWith('```') || chunk.trim().endsWith('}');
+            const isPunctuation = /[.!?]$/.test(chunk.trim());
+            if (chunk.length < 1000 && (isPunctuation || isCodeBlock)) break;
+
+            await sleep(Math.min(5000, chunk.length * 20));
+            await browserDriver.ensureFocus(page);
+            await browserDriver.typePrompt(page, 'continue', task.meta.id);
+            await page.keyboard.press('Enter');
+            await sleep(2000);
+
+          } catch (waitErr) {
+            const status = await triage.diagnoseStall(page);
+            if (status === 'THINKING' || status === 'LOADING') continue;
+            
+            if (status === 'BROWSER_FROZEN') {
+              await system.killChrome();
+              throw new Error('BROWSER_FROZEN');
+            }
+            if (status === 'NETWORK_ERROR' || status === 'CAPTCHA') throw new Error(status);
+            break;
+          }
+        }
+
+        if (!fullResponse.trim()) throw new Error('EMPTY_RESPONSE');
+
+        // 9. FINALIZAÇÃO (SUCESSO)
+        task.state.status = 'DONE';
+        task.state.completed_at = new Date().toISOString();
+        task.result = { file_path: outPath, session_url: page.url() };
+
+        io.saveTask(task);
+        await browserDriver.commitLearning();
+
+        log('INFO', '<<< Sucesso', task.meta.id);
+        consecutiveTaskFailures = 0;
+
+      } catch (taskErr) {
+        log('ERROR', `Erro tarefa: ${taskErr.message}`, task.meta.id);
+        await forensics.createCrashDump(page, taskErr, task.meta.id);
+        
+        // FEEDBACK PARA O ORCHESTRATOR
+        if (taskErr.message.includes('Target closed') || taskErr.message.includes('Session closed')) {
+            log('WARN', 'Sinalizando perda de navegador para o Orchestrator.');
+            orchestrator.cleanup(); // Força reset do estado
+            consecutiveInfraFailures++;
+        }
+
+        classifyFailure(task, 'LLM', taskErr.message);
+        io.saveTask(task);
+        consecutiveTaskFailures++;
+      } finally {
+        io.releaseLock();
+        if (global.gc) global.gc();
+      }
+
+    } catch (fatal) {
+      log('FATAL', `Loop fatal: ${fatal.message}`);
+      await sleep(5000);
+    }
+  }
+}
+
+process.on('uncaughtException', e => { log('FATAL', `Uncaught: ${e.message}`); });
+main();

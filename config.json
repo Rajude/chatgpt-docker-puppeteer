@@ -1,0 +1,36 @@
+{
+  "_comment": "Configuração Mestra - Agente Universal V5.0",
+
+  "// --- COMPORTAMENTO DO MODELO ---": "",
+  "DEFAULT_MODEL_ID": "gpt-5",
+  "adaptive_mode": "auto",
+
+  "// --- TIMEOUTS & PACIÊNCIA ---": "",
+  "IDLE_SLEEP": 3000,
+  "STABILITY_INTERVAL": 2000,
+  "PROGRESS_TIMEOUT_MS": 90000,
+  "HEARTBEAT_TIMEOUT_MS": 15000,
+  "ECHO_CONFIRM_TIMEOUT_MS": 5000,
+  
+  "// --- LIMITES DE EXECUÇÃO ---": "",
+  "TASK_TIMEOUT_MS": 1800000,
+  "RUNNING_RECOVERY_MS": 2400000,
+  "MAX_CONTINUATIONS": 25,
+  "MAX_OUT_BYTES": 10485760,
+  
+  "// --- DIGITAÇÃO HUMANA ---": "",
+  "CHUNK_SIZE": 150,
+  "ECHO_RETRIES": 5,
+  "ADAPTIVE_DELAY_BASE": 40,
+  "ADAPTIVE_DELAY_MAX": 250,
+  
+  "// --- POLÍTICAS DE SEGURANÇA ---": "",
+  "allow_dom_assist": true,
+  "multi_tab_policy": "AUTO_CLOSE",
+  "USER_INACTIVITY_THRESHOLD_MS": 2000,
+  "USER_ABORT_ACTION": "PAUSE",
+
+  "// --- TUNING DO ADAPTATIVO ---": "",
+  "ADAPTIVE_ALPHA": 0.15,
+  "ADAPTIVE_COOLDOWN_MS": 5000
+}

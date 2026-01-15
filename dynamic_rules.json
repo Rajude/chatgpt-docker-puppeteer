@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "created_by": "system_init",
+    "version": 1
+  },
+  "selectors": {
+    "input_box": [
+      "#prompt-textarea",
+      "div[contenteditable='true'][role='textbox']",
+      "textarea"
+    ],
+    "send_button": [
+      "[data-testid='send-button']"
+    ]
+  }
+}
