@@ -8,7 +8,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
     - uses: actions/checkout@v4
     - name: Setup Node
@@ -21,4 +24,14 @@ jobs:
     - name: Run lint/test (if scripts available)
       run: |
         if npm run | grep -q "lint"; then npm run lint; fi
-        if npm run | grep -q "test"; then npm test --if-present; fi
+
+    - name: Run tests (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        if npm run | grep -q "test:linux"; then npm run test:linux --if-present; fi
+
+    - name: Run tests (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: pwsh
+      run: |
+        if (npm run | Select-String "test:win") { npm run test:win }
