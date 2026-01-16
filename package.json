@@ -1,6 +1,6 @@
 {
   "name": "agente-chatgpt-puppeteer",
-  "version": "4.0.0",
+  "version": "1.0.0",
   "description": "Agente autônomo Modular (Audit Level 19) com arquitetura Domain-Driven, sistema adaptativo de latência, SADI e gestão via PM2.",
   "private": true,
   "main": "index.js",
@@ -28,7 +28,7 @@
     "queue:import": "node scripts/importar_prompts.js",
     "queue:graph": "node scripts/visualizar_fila.js > fila.dot && echo [INFO] Arquivo 'fila.dot' gerado.",
     "queue:flow": "node scripts/flow_manager.js",
-    
+
     "// --- MAINTENANCE & DIAGNOSTICS ---": "Limpeza e análise forense",
     "clean": "node -e \"const fs=require('fs'); ['logs', 'tmp', 'RUNNING.lock'].forEach(p => fs.rmSync(p, {recursive:true, force:true})); console.log('[OK] Ambiente limpo.');\"",
     "clean:queue": "node -e \"const fs=require('fs'); const path=require('path'); const D='fila'; if(fs.existsSync(D)) fs.readdirSync(D).filter(f=>f.endsWith('.json')).forEach(f=>fs.rmSync(path.join(D,f))); console.log('[OK] Fila limpa.');\"",

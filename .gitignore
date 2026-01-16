@@ -1,3 +1,6 @@
-node_modules
+node_modules/
 .tmp.driveupload/
+local-login/
 local-login/profile/
+profile/
+.vscode-server/
